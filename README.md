@@ -120,3 +120,9 @@ TAB5（360MHz）、Avatar・USB処理と並行で、12,010円の試験音声を�
 c++ -std=c++11 -O2 -fsanitize=address,undefined tests/p4_conv_test.cpp -o /tmp/tab5-p4-conv-test
 /tmp/tab5-p4-conv-test
 ```
+
+## ライセンス
+
+このプロジェクトの自作コードおよびドキュメントは [MIT License](LICENSE) で公開しています。著作権表示は Copyright (c) 2026 tarusake です。
+
+依存ライブラリおよび第三者由来のファイルには、それぞれのライセンスが適用されます。sanoTTS-jpの音声モデルと生成音声には、このプロジェクトのMITライセンスは適用されません。[モデルの利用条件・帰属表示](third_party/sanotts/README.md)を確認してください。モデルを含むファームウェアを配布する場合も、モデルと各依存ライブラリの条件に従ってください。
