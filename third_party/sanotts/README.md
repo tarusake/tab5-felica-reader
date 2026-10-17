@@ -16,3 +16,5 @@
 - 他者に対して二次利用（素材としての利用）を許可する形で公開すること。
 
 詳細・優先される提供元条件は `LICENSE-MODEL.md` と https://tyc.rei-yumesaki.net/material/corpus/ を参照してください。
+
+P4向け変更: `scripts/sanotts_p4.py` がW8A32畳み込みの入口へ条件付きフックを追加し、プロジェクトの `include/sanotts_p4_conv.h` を呼びます。モデルの重みは変更していません。未対応の形状では元のコードへ戻ります。

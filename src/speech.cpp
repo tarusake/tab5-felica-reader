@@ -4,6 +4,13 @@
 #include <freertos/queue.h>
 #include <cmath>
 #include <vector>
+#include <esp_cpu.h>
+extern "C" {
+#include <core/saan_prof.h>
+#if SAAN_PROFILE
+uint32_t saan_prof_now(void) { return esp_cpu_get_cycle_count(); }
+#endif
+}
 #include "speech.h"
 #include "balance_speech.h"
 
@@ -29,7 +36,7 @@ void collect(const int16_t* pcm, size_t count, void* user) {
 void worker(void*) {
     SanoTTS tts;
     // A slightly longer utterance is easier to understand over TAB5's speaker.
-    tts.setLengthScale(1.5f);
+    tts.setLengthScale(1.7f);
     Audio audio;
     audio.samples = static_cast<int16_t*>(heap_caps_malloc(capacity * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     const bool available = audio.samples && tts.begin();
@@ -39,6 +46,22 @@ void worker(void*) {
         unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     int balance;
     std::vector<int16_t> introduction;
+    std::vector<int16_t> ending;
+    // Generate fixed phrases on the device once, then reuse them.
+    auto cache = [&](const char* phrase, std::vector<int16_t>& saved) {
+        if (!saved.empty()) return true;
+        audio.used = 0;
+        audio.overflow = false;
+        if (!tts.synthesize(phrase, collect, &audio) || audio.overflow || !audio.used) return false;
+        saved.assign(audio.samples, audio.samples + audio.used);
+        return true;
+    };
+    if (available) {
+        const uint32_t start = millis();
+        const bool ready = cache("のこり", introduction) && cache("です", ending);
+        Serial.printf("TTS fixed phrases: %s, prepare=%lu ms\n",
+            ready ? "ready" : "failed (retry on request)", (unsigned long)(millis() - start));
+    }
     while (true) {
         xQueueReceive(requests, &balance, portMAX_DELAY);
         if (!available) { Serial.println("TTS unavailable; beep/display still active"); continue; }
@@ -47,28 +70,40 @@ void worker(void*) {
         audio.used = 0;
         audio.overflow = false;
         const uint32_t start = millis();
-        // Synthesize the fixed introduction once, then insert a definite beat
-        // of silence before the separately synthesized amount.
-        bool ok = true;
-        if (introduction.empty()) {
-            ok = tts.synthesize("のこり", collect, &audio);
-            if (ok && !audio.overflow && audio.used) {
-                introduction.assign(audio.samples, audio.samples + audio.used);
-            } else {
-                ok = false;
-            }
-        }
+#if SAAN_PROFILE
+        saan_prof_reset();
+#endif
+        bool ok = cache("のこり", introduction) && cache("です", ending);
         if (ok) {
-            constexpr size_t pauseSamples = sampleRate * 300 / 1000;
+            constexpr size_t pauseSamples = sampleRate * 100 / 1000;
             memcpy(audio.samples, introduction.data(), introduction.size() * sizeof(int16_t));
             memset(audio.samples + introduction.size(), 0, pauseSamples * sizeof(int16_t));
             audio.used = introduction.size() + pauseSamples;
             audio.overflow = false;
-            const auto amount = text.substr(text.find('#') + 1);
+            auto amount = text.substr(text.find('#') + 1);
+            // balanceSpeech always ends in 「です」; synthesize through 「えん」.
+            amount.resize(amount.size() - std::string("です").size());
             ok = tts.synthesize(amount.c_str(), collect, &audio);
+            if (ok && !audio.overflow) {
+                if (pauseSamples + ending.size() > capacity - audio.used) {
+                    audio.overflow = true;
+                } else {
+                    memset(audio.samples + audio.used, 0, pauseSamples * sizeof(int16_t));
+                    audio.used += pauseSamples;
+                    memcpy(audio.samples + audio.used, ending.data(), ending.size() * sizeof(int16_t));
+                    audio.used += ending.size();
+                }
+            }
         }
         Serial.printf("TTS: %s / synth=%lu ms audio=%u ms peak=%ld\n", text.c_str(),
             (unsigned long)(millis() - start), unsigned(audio.used * 1000 / sampleRate), (long)tts.absmax());
+        Serial.printf("TTS checksum=%016llx samples=%lu\n", (unsigned long long)tts.checksum(), (unsigned long)tts.samples());
+#if SAAN_PROFILE
+        for (int id = 0; id < SAAN_PROF_N; ++id) {
+            if (saan_prof_cnt[id]) Serial.printf("TTS profile %s=%llu cycles (%lu calls)\n", saan_prof_name(id),
+                (unsigned long long)saan_prof_acc[id], (unsigned long)saan_prof_cnt[id]);
+        }
+#endif
         if (!ok || audio.overflow || !audio.used) {
             Serial.printf("TTS synthesis failed: %s, overflow=%d\n", tts.lastError(), audio.overflow);
             continue;
