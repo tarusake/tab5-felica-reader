@@ -2,6 +2,8 @@
 
 M5Stack TAB5のUSB-A Host端子にSony RC-S380をつなぎ、Suicaの最新利用履歴から残高を読み取って画面に表示するPlatformIOプロジェクトです。カードへの書き込みやネットワーク送信は行いません。
 
+![TAB5のサイバー風画面とUSB接続したSony RC-S380](docs/images/tab5-felica-reader.jpg)
+
 ## 接続と実行
 
 1. RC-S380をTAB5のUSB-A端子に接続します。
