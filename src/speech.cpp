@@ -3,6 +3,7 @@
 #include <esp_heap_caps.h>
 #include <freertos/queue.h>
 #include <cmath>
+#include <vector>
 #include "speech.h"
 #include "balance_speech.h"
 
@@ -37,6 +38,7 @@ void worker(void*) {
         unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     int balance;
+    std::vector<int16_t> introduction;
     while (true) {
         xQueueReceive(requests, &balance, portMAX_DELAY);
         if (!available) { Serial.println("TTS unavailable; beep/display still active"); continue; }
@@ -45,7 +47,26 @@ void worker(void*) {
         audio.used = 0;
         audio.overflow = false;
         const uint32_t start = millis();
-        bool ok = tts.synthesize(text.c_str(), collect, &audio);
+        // Synthesize the fixed introduction once, then insert a definite beat
+        // of silence before the separately synthesized amount.
+        bool ok = true;
+        if (introduction.empty()) {
+            ok = tts.synthesize("のこり", collect, &audio);
+            if (ok && !audio.overflow && audio.used) {
+                introduction.assign(audio.samples, audio.samples + audio.used);
+            } else {
+                ok = false;
+            }
+        }
+        if (ok) {
+            constexpr size_t pauseSamples = sampleRate * 300 / 1000;
+            memcpy(audio.samples, introduction.data(), introduction.size() * sizeof(int16_t));
+            memset(audio.samples + introduction.size(), 0, pauseSamples * sizeof(int16_t));
+            audio.used = introduction.size() + pauseSamples;
+            audio.overflow = false;
+            const auto amount = text.substr(text.find('#') + 1);
+            ok = tts.synthesize(amount.c_str(), collect, &audio);
+        }
         Serial.printf("TTS: %s / synth=%lu ms audio=%u ms peak=%ld\n", text.c_str(),
             (unsigned long)(millis() - start), unsigned(audio.used * 1000 / sampleRate), (long)tts.absmax());
         if (!ok || audio.overflow || !audio.used) {
