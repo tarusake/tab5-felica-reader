@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include "rf_response.h"
+#include "balance_display.h"
 
 // USB client calls belong to the Arduino loop task; Avatar owns display updates.
 static usb_host_client_handle_t client;
@@ -17,44 +18,154 @@ static uint32_t secondBeepAt;
 static SemaphoreHandle_t faceStatusMutex;
 static char faceStatus[128] = "RC-S380を接続してください";
 static int faceBalance = -1;
+static volatile uint32_t uiFrames;
+static volatile int uiRenderedBalance = -1;
 
-// Add the status/footer to the library's sprite, keeping all drawing in one task.
+// Diagnostic capture of the actual LCD framebuffer, downsampled to 320x180.
+static void captureScreen() {
+    const int w = M5.Display.width(), h = M5.Display.height();
+    std::vector<lgfx::rgb888_t> row(w);
+    std::vector<uint8_t> output((w / 4) * 3);
+    Serial.printf("SCREENSHOT\nP6\n%d %d\n255\n", w / 4, h / 4);
+    for (int y = 0; y < h; y += 4) {
+        M5.Display.readRect(0, y, w, 1, row.data());
+        for (int x = 0; x < w / 4; ++x) {
+            output[x * 3] = row[x * 4].R8();
+            output[x * 3 + 1] = row[x * 4].G8();
+            output[x * 3 + 2] = row[x * 4].B8();
+        }
+        Serial.write(output.data(), output.size());
+    }
+}
+
+namespace ui {
+constexpr uint32_t background = 0x030711U;
+constexpr uint32_t panel = 0x091525U;
+constexpr uint32_t border = 0x17445aU;
+constexpr uint32_t mint = 0x35f4ffU;
+constexpr uint32_t white = 0xe5faffU;
+constexpr uint32_t muted = 0x83a9c3U;
+constexpr uint32_t magenta = 0xff42bfU;
+constexpr uint32_t grid = 0x0b2436U;
+constexpr uint32_t amber = 0xffb24dU;
+}
+
+// Draw the interface into Avatar's sprite so all display writes share one task.
 class StatusMouth : public m5avatar::Drawable {
-    m5avatar::Mouth mouth{100, 150, 8, 100};
+    m5avatar::Mouth mouth{70, 110, 7, 80};
 public:
     void draw(M5Canvas* canvas, m5avatar::BoundingRect rect,
               m5avatar::DrawContext* context) override {
-        mouth.draw(canvas, rect, context);
         char status[sizeof(faceStatus)];
         int balance;
         xSemaphoreTake(faceStatusMutex, portMAX_DELAY);
         memcpy(status, faceStatus, sizeof(status));
         balance = faceBalance;
         xSemaphoreGive(faceStatusMutex);
-        canvas->setFont(&fonts::lgfxJapanGothic_40);
-        canvas->setTextDatum(m5gfx::textdatum_t::top_center);
-        // Text colors are RGB values, not monochrome palette indices.
-        // RGB 0x000001 converts to black in the 1-bit sprite.
-        canvas->setTextColor(TFT_WHITE, TFT_BLACK);
-        canvas->setTextSize(1);
-        canvas->drawString(status, canvas->width() / 2, 354);
-        if (balance >= 0) {
-            char text[32];
-            snprintf(text, sizeof(text), "%d 円", balance);
-            canvas->setTextSize(2);
-            canvas->drawString(text, canvas->width() / 2, 468);
-            canvas->setTextSize(1);
+        const bool error = strstr(status, "エラー") || strstr(status, "失敗");
+        const bool connected = !strstr(status, "RC-S380");
+        const uint32_t accent = error ? ui::amber : ui::mint;
+        // Subtle technical grid and a moving scan line behind the live face.
+        for (int x = 60; x <= 572; x += 32) canvas->drawFastVLine(x, 162, 420, ui::grid);
+        for (int y = 162; y <= 582; y += 32) canvas->drawFastHLine(60, y, 512, ui::grid);
+        canvas->drawCircle(316, 328, 185, ui::border);
+        canvas->drawCircle(316, 328, 191, ui::grid);
+        const int scanY = 172 + (millis() / 22) % 400;
+        canvas->drawFastHLine(76, scanY, 480, ui::border);
+        // Bracketed face viewport, with small ticks rather than a solid box.
+        for (int side : {0, 1}) {
+            int x = side ? 572 : 60;
+            for (int bottom : {0, 1}) {
+                int y = bottom ? 582 : 162;
+                canvas->fillRect(side ? x - 30 : x, y, 30, 3, ui::mint);
+                canvas->fillRect(x, bottom ? y - 26 : y, 3, 26, ui::mint);
+            }
         }
+        mouth.draw(canvas, rect, context);
+        canvas->setTextSize(1);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_left);
+        canvas->setFont(&fonts::FreeSansBold24pt7b);
+        canvas->setTextColor(ui::white, ui::background);
+        canvas->fillRect(48, 49, 5, 38, ui::magenta);
+        canvas->fillRect(58, 49, 5, 24, ui::mint);
+        canvas->setTextColor(ui::magenta, ui::background);
+        canvas->drawString("STACK//PASS", 79, 45);
+        canvas->setTextColor(ui::white);
+        canvas->drawString("STACK//PASS", 76, 43);
+        canvas->setFont(&fonts::FreeSans12pt7b);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_right);
+        canvas->setTextColor(ui::muted, ui::background);
+        canvas->drawString("CONTACTLESS / SUICA", 1228, 60);
+        canvas->drawFastHLine(48, 115, 1184, ui::border);
+        canvas->drawFastHLine(48, 115, 180, ui::mint);
+        canvas->drawFastHLine(1100, 115, 132, ui::magenta);
+
+        // Face stays on the left, with a quiet caption underneath.
+        canvas->setTextDatum(m5gfx::textdatum_t::top_center);
+        canvas->setFont(&fonts::lgfxJapanGothic_24);
+        canvas->setTextColor(ui::muted, ui::background);
+        canvas->drawString(balance >= 0 ? "読み取れたよ！" : "タッチして、アクセス。", 316, 524);
+
+        // A fixed panel keeps the layout stable between waiting and success.
+        canvas->fillRect(610, 166, 622, 414, ui::panel);
+        canvas->drawRect(610, 166, 622, 414, ui::border);
+        // Clipped corners and bright short rails give the panel a HUD silhouette.
+        canvas->fillTriangle(610, 166, 634, 166, 610, 190, ui::background);
+        canvas->drawLine(610, 190, 634, 166, accent);
+        canvas->fillTriangle(1231, 579, 1207, 579, 1231, 555, ui::background);
+        canvas->drawLine(1207, 579, 1231, 555, ui::magenta);
+        canvas->fillRect(634, 166, 130, 3, accent);
+        canvas->fillRect(1230, 190, 3, 72, ui::magenta);
+        canvas->drawFastHLine(652, 246, 538, ui::border);
+        for (int x = 1110; x < 1190; x += 10) canvas->fillRect(x, 204, 4, 12, ui::border);
+        canvas->fillCircle(654, 206, 5, accent);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_left);
+        canvas->setFont(&fonts::FreeSans12pt7b);
+        canvas->setTextColor(accent, ui::panel);
+        canvas->drawString(balance >= 0 ? "BALANCE" : error ? "PLEASE RETRY" : connected ? "READY TO SCAN" : "CONNECT READER", 674, 193);
+        canvas->setFont(&fonts::lgfxJapanGothic_40);
+        canvas->setTextColor(balance >= 0 ? ui::mint : ui::white, ui::panel);
+        if (balance >= 0) {
+            char amount[32];
+            if (balance >= 1000) snprintf(amount, sizeof(amount), "%d,%03d", balance / 1000, balance % 1000);
+            else snprintf(amount, sizeof(amount), "%d", balance);
+            canvas->setTextSize(2);
+            canvas->drawString(amount, 652, 282);
+            canvas->setTextSize(1);
+            canvas->setFont(&fonts::lgfxJapanGothic_24);
+            canvas->setTextColor(ui::muted, ui::panel);
+            canvas->drawString("円 / JPY", 656, 389);
+            canvas->drawFastHLine(652, 450, 538, ui::border);
+            canvas->setTextColor(ui::mint, ui::panel);
+            canvas->drawString("読み取り完了", 656, 486);
+        } else {
+            canvas->drawString(error ? "もう一度お試しください" : connected ? "カードをかざす" : "リーダーを接続", 652, 290);
+            canvas->setFont(&fonts::lgfxJapanGothic_24);
+            canvas->setTextColor(ui::muted, ui::panel);
+            canvas->drawString(error ? "カードやUSBの接続を確認してください" : connected ? "Suicaをリーダーの上に置いてください" : "RC-S380をUSBにつないでください", 656, 375);
+        }
+        canvas->drawFastHLine(48, 633, 1184, ui::border);
+        canvas->fillCircle(60, 674, 5, connected ? accent : ui::muted);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_left);
+        canvas->setFont(&fonts::lgfxJapanGothic_24);
+        canvas->setTextColor(ui::muted, ui::background);
+        canvas->drawString(status, 80, 658);
+        canvas->setFont(&fonts::FreeSans12pt7b);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_right);
+        canvas->setTextColor(ui::mint, ui::background);
+        canvas->drawString("STACK-CHAN / ONLINE", 1230, 662);
+        uiRenderedBalance = balance;
+        ++uiFrames;
     }
 };
 
-// Eyes, mouth, expressions, blinking and gaze are rendered by M5Stack-Avatar.
+// Native Avatar components retain blinking, gaze and expression animations.
 static m5avatar::Avatar avatar(new m5avatar::Face(
-    new StatusMouth(), new m5avatar::BoundingRect(235, 640),
-    new m5avatar::Eye(28, false), new m5avatar::BoundingRect(130, 400),
-    new m5avatar::Eye(28, true), new m5avatar::BoundingRect(130, 880),
-    new m5avatar::Eyeblow(90, 0, false), new m5avatar::BoundingRect(75, 400),
-    new m5avatar::Eyeblow(90, 0, true), new m5avatar::BoundingRect(75, 880)));
+    new StatusMouth(), new m5avatar::BoundingRect(382, 316),
+    new m5avatar::Eye(24, false), new m5avatar::BoundingRect(295, 206),
+    new m5avatar::Eye(24, true), new m5avatar::BoundingRect(295, 426),
+    new m5avatar::Eyeblow(64, 0, false), new m5avatar::BoundingRect(244, 206),
+    new m5avatar::Eyeblow(64, 0, true), new m5avatar::BoundingRect(244, 426)));
 static const uint8_t ack[] = {0, 0, 0xff, 0, 0xff, 0};
 
 static void playReadConfirmation() {
@@ -300,17 +411,17 @@ void setup() {
     Serial.begin(115200);
     M5.Speaker.setVolume(64); // 0..255; start at a moderate volume.
     M5.Display.setRotation(1);
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setFont(&fonts::lgfxJapanGothic_40);
-    M5.Display.setTextDatum(m5gfx::textdatum_t::top_center);
-    M5.Display.drawString("Suica 残高リーダー", M5.Display.width() / 2, 15);
+    M5.Display.fillScreen(ui::background);
     faceStatusMutex = xSemaphoreCreateMutex();
     configASSERT(faceStatusMutex);
-    avatar.getFace()->getBoundingRect()->setPosition(64, 0);
-    avatar.getFace()->getBoundingRect()->setSize(M5.Display.width(), M5.Display.height() - 64);
-    avatar.setSpeechFont(&fonts::lgfxJapanGothic_40);
-    avatar.init();
+    avatar.getFace()->getBoundingRect()->setPosition(0, 0);
+    avatar.getFace()->getBoundingRect()->setSize(M5.Display.width(), M5.Display.height());
+    auto palette = avatar.getColorPalette();
+    palette.set(COLOR_PRIMARY, M5.Display.color565(53, 244, 255));
+    palette.set(COLOR_BACKGROUND, M5.Display.color565(3, 7, 17));
+    avatar.setColorPalette(palette);
+    avatar.setSpeechFont(&fonts::lgfxJapanGothic_24);
+    avatar.init(8);
     M5.Power.setExtOutput(true, m5::ext_USB);
     show("RC-S380を接続してください");
     usb_host_config_t host = {};
@@ -326,6 +437,11 @@ void setup() {
 }
 
 void loop() {
+    if (Serial.available()) {
+        const int diagnostic = Serial.read();
+        if (diagnostic == 's') captureScreen();
+        if (diagnostic == 'd') Serial.printf("UI frames=%lu balance=%d\n", (unsigned long)uiFrames, int(uiRenderedBalance));
+    }
     updateReadConfirmation();
     usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
     if (disconnected) { closeReader(); show("RC-S380を接続してください"); }
@@ -333,19 +449,27 @@ void loop() {
     static uint32_t lastRead;
     static int lastBalance = -1;
     static ReadResult lastResult = ReadResult::NoCard;
-    if (!ready) { lastBalance = -1; lastResult = ReadResult::NoCard; return; }
+    static ReadResult lastRawResult = ReadResult::NoCard;
+    static BalanceDisplay display;
+    if (!ready) {
+        lastBalance = -1;
+        lastResult = lastRawResult = ReadResult::NoCard;
+        display.reset();
+        return;
+    }
     if (millis() - lastRead < 500) return;
     lastRead = millis();
     int balance = -1;
-    auto result = readBalance(balance);
+    const auto rawResult = readBalance(balance);
     if (disconnected) return;
+    const bool confirmRead = rawResult == ReadResult::Balance && lastRawResult != ReadResult::Balance;
+    lastRawResult = rawResult;
+    const auto result = display.update(rawResult, balance, millis());
     if (result != lastResult || balance != lastBalance) {
         switch (result) {
         case ReadResult::Balance:
             show("残高", balance);
             Serial.printf("Balance: %d JPY\n", balance);
-            // Playback is asynchronous, so USB event handling can continue.
-            if (lastResult != ReadResult::Balance) playReadConfirmation();
             break;
         case ReadResult::NoCard: show("Suicaをかざしてください"); break;
         case ReadResult::Unsupported: show("読取失敗：カードを置き直す"); break;
@@ -354,4 +478,6 @@ void loop() {
         lastBalance = balance;
         lastResult = result;
     }
+    // Sound follows actual card reads, independently of the held display state.
+    if (confirmRead) playReadConfirmation();
 }
