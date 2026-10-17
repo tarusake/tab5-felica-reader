@@ -6,6 +6,9 @@
 #include "rf_response.h"
 #include "balance_display.h"
 #include "speech.h"
+#include "suica_history.h"
+#include "stations.h"
+#include "station_toggle.h"
 
 // USB client calls belong to the Arduino loop task; Avatar owns display updates.
 static usb_host_client_handle_t client;
@@ -151,10 +154,18 @@ public:
         canvas->setFont(&fonts::lgfxJapanGothic_24);
         canvas->setTextColor(ui::muted, ui::background);
         canvas->drawString(status, 80, 658);
-        canvas->setFont(&fonts::FreeSans12pt7b);
-        canvas->setTextDatum(m5gfx::textdatum_t::top_right);
-        canvas->setTextColor(ui::mint, ui::background);
-        canvas->drawString("STACK-CHAN / ONLINE", 1230, 662);
+        const bool stationOn = stationSpeechEnabled();
+        const uint32_t toggleColor = stationOn ? ui::mint : ui::muted;
+        canvas->fillRoundRect(stationToggle::x, stationToggle::y,
+            stationToggle::width, stationToggle::height, 10, ui::panel);
+        canvas->drawRoundRect(stationToggle::x, stationToggle::y,
+            stationToggle::width, stationToggle::height, 10, toggleColor);
+        canvas->setFont(&fonts::lgfxJapanGothic_24);
+        canvas->setTextColor(toggleColor, ui::panel);
+        canvas->drawString("駅名読み上げ", 874, 664);
+        canvas->setFont(&fonts::FreeSansBold12pt7b);
+        canvas->drawString(stationOn ? "ON" : "OFF", 1100, 664);
+        canvas->fillCircle(1198, 676, 7, toggleColor);
         uiRenderedBalance = balance;
         ++uiFrames;
     }
@@ -339,7 +350,8 @@ static ReadResult exchangeFelica(const std::vector<uint8_t>& felica, std::vector
     return ReadResult::Balance;
 }
 
-static ReadResult readBalance(int& balance) {
+static ReadResult readBalance(int& balance, const Station*& station, bool readStation) {
+    station = nullptr;
     std::vector<uint8_t> response;
     auto result = exchangeFelica({6, 0, 0, 3, 0, 0}, response); // Polling system 0003
     if (result != ReadResult::Balance) return result;
@@ -356,6 +368,27 @@ static ReadResult readBalance(int& balance) {
     if (response.size() != 29 || response[12] != 1) return ReadResult::Unsupported;
     // Latest history record: balance is little endian at offsets 10 and 11.
     balance = response[23] | (response[24] << 8);
+    if (readStation) {
+        // Search newest first, up to the 20 publicly readable history blocks.
+        // Additional history failure must not invalidate the successful balance.
+        for (int block = 0; block < 20; ++block) {
+            if (block) {
+                request.back() = uint8_t(block);
+                if (exchangeFelica(request, response) != ReadResult::Balance ||
+                    response.size() != 29 || response[1] != 7 ||
+                    memcmp(response.data() + 2, idm, 8) || response[10] || response[11] || response[12] != 1) break;
+            }
+            const auto* record = response.data() + 13;
+            if (!(record[4] || record[5])) break; // unused history
+            uint32_t key;
+            if (exitStationKey(record, 16, key)) {
+                station = findStation(key);
+                Serial.printf("Latest rail exit: block=%d code=%06lx station=%s\n", block,
+                    (unsigned long)key, station ? station->name : "unknown");
+                break; // Never substitute an older known station for an unknown latest one.
+            }
+        }
+    }
     return ReadResult::Balance;
 }
 
@@ -439,9 +472,20 @@ void setup() {
 }
 
 void loop() {
+    M5.update();
+    for (int i = 0; i < M5.Touch.getCount(); ++i) {
+        const auto touch = M5.Touch.getDetail(i);
+        if (touch.wasPressed() && stationToggle::contains(touch.x, touch.y)) {
+            const bool enabled = !stationSpeechEnabled();
+            setStationSpeechEnabled(enabled);
+            Serial.printf("Station speech mode: %s\n", enabled ? "ON" : "OFF");
+            break; // A multi-touch press still toggles only once per update.
+        }
+    }
     if (Serial.available()) {
         const int diagnostic = Serial.read();
         if (diagnostic == 's') captureScreen();
+        if (diagnostic == 't') { playReadConfirmation(); speakBalance(12010, findStation(0x000101)); }
         if (diagnostic == 'v') { playReadConfirmation(); speakBalance(12010); }
         if (diagnostic == 'd') Serial.printf("UI frames=%lu balance=%d\n", (unsigned long)uiFrames, int(uiRenderedBalance));
     }
@@ -463,7 +507,8 @@ void loop() {
     if (millis() - lastRead < 500) return;
     lastRead = millis();
     int balance = -1;
-    const auto rawResult = readBalance(balance);
+    const Station* station = nullptr;
+    const auto rawResult = readBalance(balance, station, stationSpeechEnabled() && lastRawResult != ReadResult::Balance);
     if (disconnected) return;
     const bool confirmRead = rawResult == ReadResult::Balance && lastRawResult != ReadResult::Balance;
     lastRawResult = rawResult;
@@ -484,6 +529,6 @@ void loop() {
     // Sound follows actual card reads, independently of the held display state.
     if (confirmRead) {
         playReadConfirmation();
-        speakBalance(balance);
+        speakBalance(balance, station);
     }
 }
