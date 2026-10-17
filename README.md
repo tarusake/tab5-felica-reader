@@ -77,3 +77,30 @@ c++ -std=c++11 tests/rf_response_test.cpp -o /tmp/tab5-rf-response-test
 ### 描画診断
 
 シリアル接続から `d` を送ると描画フレーム数と描画側の残高を出力します。`s` を送ると実際のLCDフレームバッファを320×180のPPM画像として返します（`SCREENSHOT` 行に続くP6ヘッダーとRGBデータ）。画像取得中はUSBのポーリングが一時的に止まります。
+
+## 残高の音声読み上げ（sanoTTS-jp）
+
+読み取り成功時、確認音に続いて「のこり○○えんです」と内蔵スピーカーで読み上げます。Wi-Fiや漢字辞書は不要です。かな入力・汎用Cの推論でESP32-P4へ移植しています。sanoTTS-jpとつくよみちゃんv4音声モデルはv1.2.0に固定しています。
+
+- `src/balance_speech.h`: 金額をかなへ変換（さんびゃく・ろっぴゃく・はっぴゃく・さんぜん・はっせんを含む）。
+- `src/speech.cpp`: 専用タスクで合成し、PSRAMへ全音声を保存してから22,050 Hz / モノラル / int16で再生します。音声バッファは20秒分、約882KBです。
+- USB読み取りとAvatarは合成中も継続します。未処理の読み上げ要求は最新1件を保持し、合成中に別の要求が来た場合は古い合成結果の再生を省きます。再生中の音声は最後まで流します。
+- P4はS3専用PIE命令を使えないため、ストリーミング再生ではなく全文生成後の再生です。初期の話速設定では、実機で「のこり#いちまんにせんじゅうえんです」が合成約3.8秒、音声約1.5秒でした（画面描画と並行）。現設定では聞き取りやすさを優先して話速を落としています。
+- 初期化や合成に失敗した場合も、残高表示と確認音は継続します。原因はシリアルへ出力します。
+- シリアルから `v` を送ると12,010円の試験音声を再生します。
+
+確認音は `M5.Speaker.setVolume(64)`、読み上げ中は `src/speech.cpp` の音量176を使い、終了後に元の音量へ戻します。話速は `setLengthScale(1.5f)` で少し遅くしています。読み上げ波形のピークは28,000へ正規化します。スピーカー出力はTAB5既定の48,000 Hzを使い、22,050 Hzの入力PCMをM5Unifiedが変換します。
+
+モデルと生成音声はMITではありません。配布時の帰属表示・用途条件を含め、[音声モデルの利用条件](third_party/sanotts/README.md)を確認してください。ライセンス本文と上流NOTICEを同梱しています。
+
+### 読み上げテスト
+
+```sh
+c++ -std=c++11 tests/balance_speech_test.cpp -o /tmp/tab5-balance-speech-test
+/tmp/tab5-balance-speech-test
+cc -O2 -DSANOTTS_ENABLE_KANJI=0 -DSANOTTS_ENABLE_PIE=0 -c .pio/libdeps/tab5/SanoTTS-jp/src/core/g2p.c -o /tmp/tab5-g2p.o
+c++ -std=c++11 -I.pio/libdeps/tab5/SanoTTS-jp/src/core tests/balance_g2p_test.cpp /tmp/tab5-g2p.o -o /tmp/tab5-balance-g2p-test
+/tmp/tab5-balance-g2p-test
+```
+
+0〜65,535円の全金額について、上流G2Pが受け付け、モデルの入力上限350 IDs以内に収まることを検証します。

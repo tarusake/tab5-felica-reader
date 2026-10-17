@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "rf_response.h"
 #include "balance_display.h"
+#include "speech.h"
 
 // USB client calls belong to the Arduino loop task; Avatar owns display updates.
 static usb_host_client_handle_t client;
@@ -434,12 +435,14 @@ void setup() {
     cc.max_num_event_msg = 8;
     cc.async.client_event_callback = usbEvent;
     ESP_ERROR_CHECK(usb_host_client_register(&cc, &client));
+    if (!beginSpeech()) Serial.println("TTS task creation failed");
 }
 
 void loop() {
     if (Serial.available()) {
         const int diagnostic = Serial.read();
         if (diagnostic == 's') captureScreen();
+        if (diagnostic == 'v') { playReadConfirmation(); speakBalance(12010); }
         if (diagnostic == 'd') Serial.printf("UI frames=%lu balance=%d\n", (unsigned long)uiFrames, int(uiRenderedBalance));
     }
     updateReadConfirmation();
@@ -479,5 +482,8 @@ void loop() {
         lastResult = result;
     }
     // Sound follows actual card reads, independently of the held display state.
-    if (confirmRead) playReadConfirmation();
+    if (confirmRead) {
+        playReadConfirmation();
+        speakBalance(balance);
+    }
 }
