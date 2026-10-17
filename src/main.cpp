@@ -1,33 +1,87 @@
 #include <M5Unified.h>
+#include <Avatar.h>
 #include <usb/usb_host.h>
 #include <vector>
 #include <algorithm>
 #include "rf_response.h"
 
-// All USB client calls and display updates belong to the Arduino loop task.
+// USB client calls belong to the Arduino loop task; Avatar owns display updates.
 static usb_host_client_handle_t client;
 static usb_device_handle_t device;
 static uint8_t pendingAddress, epIn, epOut, interfaceNumber;
 static uint16_t inPacketSize;
 static bool disconnected, claimed, ready;
+static bool secondBeepPending;
+static uint32_t secondBeepAt;
+// The Avatar draw task owns all display writes after initialization.
+static SemaphoreHandle_t faceStatusMutex;
+static char faceStatus[128] = "RC-S380を接続してください";
+static int faceBalance = -1;
+
+// Add the status/footer to the library's sprite, keeping all drawing in one task.
+class StatusMouth : public m5avatar::Drawable {
+    m5avatar::Mouth mouth{100, 150, 8, 100};
+public:
+    void draw(M5Canvas* canvas, m5avatar::BoundingRect rect,
+              m5avatar::DrawContext* context) override {
+        mouth.draw(canvas, rect, context);
+        char status[sizeof(faceStatus)];
+        int balance;
+        xSemaphoreTake(faceStatusMutex, portMAX_DELAY);
+        memcpy(status, faceStatus, sizeof(status));
+        balance = faceBalance;
+        xSemaphoreGive(faceStatusMutex);
+        canvas->setFont(&fonts::lgfxJapanGothic_40);
+        canvas->setTextDatum(m5gfx::textdatum_t::top_center);
+        // Text colors are RGB values, not monochrome palette indices.
+        // RGB 0x000001 converts to black in the 1-bit sprite.
+        canvas->setTextColor(TFT_WHITE, TFT_BLACK);
+        canvas->setTextSize(1);
+        canvas->drawString(status, canvas->width() / 2, 354);
+        if (balance >= 0) {
+            char text[32];
+            snprintf(text, sizeof(text), "%d 円", balance);
+            canvas->setTextSize(2);
+            canvas->drawString(text, canvas->width() / 2, 468);
+            canvas->setTextSize(1);
+        }
+    }
+};
+
+// Eyes, mouth, expressions, blinking and gaze are rendered by M5Stack-Avatar.
+static m5avatar::Avatar avatar(new m5avatar::Face(
+    new StatusMouth(), new m5avatar::BoundingRect(235, 640),
+    new m5avatar::Eye(28, false), new m5avatar::BoundingRect(130, 400),
+    new m5avatar::Eye(28, true), new m5avatar::BoundingRect(130, 880),
+    new m5avatar::Eyeblow(90, 0, false), new m5avatar::BoundingRect(75, 400),
+    new m5avatar::Eyeblow(90, 0, true), new m5avatar::BoundingRect(75, 880)));
 static const uint8_t ack[] = {0, 0, 0xff, 0, 0xff, 0};
 
-static void show(const char* status, int balance = -1) {
-    auto& lcd = M5.Display;
-    lcd.fillScreen(TFT_BLACK);
-    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setCursor(40, 45);
-    lcd.setFont(&fonts::lgfxJapanGothic_40);
-    lcd.println("Suica 残高リーダー");
-    lcd.setCursor(40, 155);
-    lcd.println(status);
-    if (balance >= 0) {
-        lcd.setCursor(40, 280);
-        lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-        lcd.setTextSize(2);
-        lcd.printf("%d 円", balance);
-        lcd.setTextSize(1);
+static void playReadConfirmation() {
+    // A short double beep inspired by a ticket gate, rather than an audio sample.
+    if (!M5.Speaker.tone(2500, 65)) {
+        Serial.println("Speaker: failed to play read confirmation");
+        return;
     }
+    secondBeepAt = millis() + 95;
+    secondBeepPending = true;
+}
+
+static void updateReadConfirmation() {
+    if (secondBeepPending && int32_t(millis() - secondBeepAt) >= 0) {
+        secondBeepPending = false;
+        M5.Speaker.tone(2500, 65);
+    }
+}
+
+static void show(const char* status, int balance = -1) {
+    xSemaphoreTake(faceStatusMutex, portMAX_DELAY);
+    snprintf(faceStatus, sizeof(faceStatus), "%s", status);
+    faceBalance = balance;
+    xSemaphoreGive(faceStatusMutex);
+    const bool error = strstr(status, "エラー") || strstr(status, "失敗");
+    avatar.setExpression(balance >= 0 ? m5avatar::Expression::Happy :
+                         error ? m5avatar::Expression::Sad : m5avatar::Expression::Neutral);
     Serial.println(status);
 }
 
@@ -241,9 +295,22 @@ static void openReader(uint8_t address) {
 
 void setup() {
     auto config = M5.config();
+    config.internal_spk = true;
     M5.begin(config);
     Serial.begin(115200);
+    M5.Speaker.setVolume(64); // 0..255; start at a moderate volume.
     M5.Display.setRotation(1);
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setFont(&fonts::lgfxJapanGothic_40);
+    M5.Display.setTextDatum(m5gfx::textdatum_t::top_center);
+    M5.Display.drawString("Suica 残高リーダー", M5.Display.width() / 2, 15);
+    faceStatusMutex = xSemaphoreCreateMutex();
+    configASSERT(faceStatusMutex);
+    avatar.getFace()->getBoundingRect()->setPosition(64, 0);
+    avatar.getFace()->getBoundingRect()->setSize(M5.Display.width(), M5.Display.height() - 64);
+    avatar.setSpeechFont(&fonts::lgfxJapanGothic_40);
+    avatar.init();
     M5.Power.setExtOutput(true, m5::ext_USB);
     show("RC-S380を接続してください");
     usb_host_config_t host = {};
@@ -259,6 +326,7 @@ void setup() {
 }
 
 void loop() {
+    updateReadConfirmation();
     usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
     if (disconnected) { closeReader(); show("RC-S380を接続してください"); }
     if (pendingAddress) { uint8_t address = pendingAddress; pendingAddress = 0; openReader(address); }
@@ -273,7 +341,12 @@ void loop() {
     if (disconnected) return;
     if (result != lastResult || balance != lastBalance) {
         switch (result) {
-        case ReadResult::Balance: show("残高", balance); Serial.printf("Balance: %d JPY\n", balance); break;
+        case ReadResult::Balance:
+            show("残高", balance);
+            Serial.printf("Balance: %d JPY\n", balance);
+            // Playback is asynchronous, so USB event handling can continue.
+            if (lastResult != ReadResult::Balance) playReadConfirmation();
+            break;
         case ReadResult::NoCard: show("Suicaをかざしてください"); break;
         case ReadResult::Unsupported: show("読取失敗：カードを置き直す"); break;
         case ReadResult::TransportError: show("通信エラー：USBを接続し直す"); ready = false; break;
