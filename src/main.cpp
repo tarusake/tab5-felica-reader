@@ -10,11 +10,16 @@
 #include "stations.h"
 #include "station_toggle.h"
 
-// USB client calls belong to the Arduino loop task; Avatar owns display updates.
+// USBクライアントの操作はArduinoのloopタスクに集約する。
+// usb-daemonはホストライブラリ全体のイベント処理、Avatarは画面描画を担当する。
+// このclientの接続通知・転送完了コールバックは、clientイベントを処理した側で呼ばれる。
 static usb_host_client_handle_t client;
 static usb_device_handle_t device;
+// 接続通知ではアドレスを保存し、実際のopenはloopへ持ち越す。
+// epIn/epOutはディスクリプタから取得するBulk転送用のアドレス。
 static uint8_t pendingAddress, epIn, epOut, interfaceNumber;
 static uint16_t inPacketSize;
+// 切断通知済み／インターフェース取得済み／RF初期化済みを区別する。
 static bool disconnected, claimed, ready;
 static bool secondBeepPending;
 static uint32_t secondBeepAt;
@@ -208,6 +213,8 @@ static void show(const char* status, int balance = -1) {
     Serial.println(status);
 }
 
+// 通知内では状態だけ記録する。通信やcloseはloop側で行う。
+// bulk()待機中にも呼ばれるので、転送中のデバイスをここで閉じないこと。
 static void usbEvent(const usb_host_client_event_msg_t* event, void*) {
     if (event->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
         pendingAddress = event->new_dev.address;
@@ -217,16 +224,21 @@ static void usbEvent(const usb_host_client_event_msg_t* event, void*) {
     }
 }
 
+// contextはbulk()内のdoneを指す。bulk()は通知までreturnしないため寿命が保たれる。
 static void transferDone(usb_transfer_t* transfer) {
     *static_cast<bool*>(transfer->context) = true;
 }
 
-// Pump asynchronous client events while waiting. Never free an in-flight DMA buffer.
+// 非同期Bulk転送を、この関数では完了まで待って同期的に扱う。
+// 待機中もclientイベントを処理しないと、完了通知も切断通知も届かない。
+// タイムアウト時も即座にfreeせず、完了通知までDMAバッファを保持する。
 static bool bulk(uint8_t endpoint, const uint8_t* output, size_t count,
                  std::vector<uint8_t>& input, uint32_t timeout = 1000) {
     if (!device || disconnected) return false;
-    const bool reading = endpoint & 0x80;
+    const bool reading = endpoint & 0x80; // bit7=1はIN（リーダー→TAB5）
+    // INの要求サイズは最大パケットサイズの倍数にする。OUTは実データ長を使う。
     size_t capacity = reading ? ((512 + inPacketSize - 1) / inPacketSize) * inPacketSize : count;
+    // ホストAPIで転送オブジェクトとDMA用バッファを確保する。
     usb_transfer_t* transfer = nullptr;
     if (usb_host_transfer_alloc(capacity, 0, &transfer) != ESP_OK) return false;
     bool done = false;
@@ -236,6 +248,7 @@ static bool bulk(uint8_t endpoint, const uint8_t* output, size_t count,
     transfer->context = &done;
     transfer->num_bytes = capacity;
     if (!reading) memcpy(transfer->data_buffer, output, count);
+    // submit成功は受付完了であり、送受信の完了ではない。
     esp_err_t error = usb_host_transfer_submit(transfer);
     if (error != ESP_OK) {
         Serial.printf("USB submit ep=%02x: %s\n", endpoint, esp_err_to_name(error));
@@ -246,6 +259,8 @@ static bool bulk(uint8_t endpoint, const uint8_t* output, size_t count,
     while (!done) {
         usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
         if (!done && !cancelled && (disconnected || millis() - start > timeout)) {
+            // タイムアウト／抜去時は転送を止め、保留転送を返却させる。
+            // flush後もdoneを待ち、ホストが参照中のバッファを解放しない。
             usb_host_endpoint_halt(device, endpoint);
             usb_host_endpoint_flush(device, endpoint);
             cancelled = true;
@@ -259,6 +274,7 @@ static bool bulk(uint8_t endpoint, const uint8_t* output, size_t count,
     if (ok && reading) input.assign(transfer->data_buffer,
                                    transfer->data_buffer + transfer->actual_num_bytes);
     if (ok && !reading) ok = transfer->actual_num_bytes == static_cast<int>(count);
+    // 受信データをコピーしてから解放。未切断なら停止した通信路も復帰させる。
     usb_host_transfer_free(transfer);
     if (cancelled && !disconnected) usb_host_endpoint_clear(device, endpoint);
     return ok;
@@ -269,8 +285,12 @@ static bool send(const uint8_t* data, size_t length) {
     return bulk(epOut, data, length, unused);
 }
 
+// USB Bulk上のPort-100コマンドを組み立て、ACKと応答フレームを検証する。
+// USBの転送境界とPort-100のフレーム境界は一致しない。
 static bool command(uint8_t code, const std::vector<uint8_t>& args,
                     std::vector<uint8_t>& response) {
+    // 拡張フレーム: 00 00 FF FF FF / LEN(L,H) / LCS / D6 / CODE / 引数 / DCS / 00。
+    // LENはD6とCODEも含む。LCS・DCSは対象範囲の和が8bitで0になるチェック値。
     uint16_t length = args.size() + 2;
     std::vector<uint8_t> frame = {0, 0, 0xff, 0xff, 0xff,
         uint8_t(length), uint8_t(length >> 8),
@@ -285,7 +305,8 @@ static bool command(uint8_t code, const std::vector<uint8_t>& args,
     bool gotAck = false;
     uint32_t start = millis();
     while (millis() - start < 1500) {
-        // ACK and response may be coalesced, or split between USB transfers.
+        // ACKと応答が一度に届く場合も、複数回に分かれる場合もある。
+        // 連結した受信データから先頭のACKを除き、続く応答全体を待つ。
         if (!bulk(epIn, nullptr, 0, packet)) return false;
         received.insert(received.end(), packet.begin(), packet.end());
         if (!gotAck && received.size() >= sizeof(ack)) {
@@ -294,6 +315,7 @@ static bool command(uint8_t code, const std::vector<uint8_t>& args,
             gotAck = true;
         }
         if (!gotAck || received.size() < 8) continue;
+        // LENとLCSを先に検証し、フレーム全体が届くまで解析を進めない。
         const uint8_t prefix[] = {0, 0, 0xff, 0xff, 0xff};
         if (memcmp(received.data(), prefix, 5) ||
             uint8_t(received[5] + received[6] + received[7]) != 0) return false;
@@ -302,13 +324,16 @@ static bool command(uint8_t code, const std::vector<uint8_t>& args,
         if (received.size() < n + 10) continue;
         sum = 0;
         for (size_t i = 8; i <= n + 8; ++i) sum += received[i];
+        // 応答方向はD7、応答コードは要求CODE+1。DCSと末尾00も確認する。
         if (sum || received[n + 9] || received[8] != 0xd7 || received[9] != code + 1) return false;
+        // Port-100の外枠を取り除き、コマンド固有の応答だけを返す。
         response.assign(received.begin() + 10, received.begin() + 8 + n);
         return true;
     }
     return false;
 }
 
+// 初期化コマンド用。成功ステータス00が1バイトだけ返ることも確認する。
 static bool statusCommand(uint8_t code, const std::vector<uint8_t>& args) {
     std::vector<uint8_t> response;
     return command(code, args, response) && response.size() == 1 && response[0] == 0;
@@ -316,12 +341,13 @@ static bool statusCommand(uint8_t code, const std::vector<uint8_t>& args) {
 
 static bool initializeReader() {
     if (!send(ack, sizeof(ack))) return false;
-    // Cancel an earlier command and discard stale data before the first command.
+    // ACK送信で以前のコマンドを中断し、残った応答を最大4回読み捨てる。
+    // ここでの短い受信タイムアウトは、読取失敗ではなく掃除の終了条件。
     std::vector<uint8_t> discarded;
     for (int i = 0; i < 4 && bulk(epIn, nullptr, 0, discarded, 30); ++i) {}
     if (!statusCommand(0x2a, {1}) || !statusCommand(0x06, {0})) return false;
     if (!statusCommand(0x00, {1, 1, 15, 1})) return false; // NFC-F, 212 kbit/s
-    // Port-100 protocol parameters: CRC, framing, guard time and RF collision avoidance.
+    // 設定番号と値の組で、CRC・フレーム形式・ガード時間・RF衝突回避を設定する。
     if (!statusCommand(0x02, {
         0x00,0x18, 0x01,1, 0x02,1, 0x03,0, 0x04,0, 0x05,0,
         0x06,0, 0x07,8, 0x08,0, 0x09,0, 0x0a,0, 0x0b,0,
@@ -329,6 +355,8 @@ static bool initializeReader() {
     return true;
 }
 
+// InCommRF（04）にFeliCaフレームを載せる。
+// USB転送失敗とRFタイムアウト（カードなし）を別の結果として扱う。
 static ReadResult exchangeFelica(const std::vector<uint8_t>& felica, std::vector<uint8_t>& result) {
     std::vector<uint8_t> args = {0xee, 0x02}; // 75 ms in 100 us units
     args.insert(args.end(), felica.begin(), felica.end());
@@ -346,6 +374,7 @@ static ReadResult exchangeFelica(const std::vector<uint8_t>& felica, std::vector
         }
         return classification;
     }
+    // RFステータス4バイトと受信ビット情報1バイトを除き、FeliCa応答を返す。
     result.assign(response.begin() + 5, response.end());
     return ReadResult::Balance;
 }
@@ -392,6 +421,8 @@ static ReadResult readBalance(int& balance, const Station*& station, bool readSt
     return ReadResult::Balance;
 }
 
+// bulk()の完了を待った後にloopから呼ぶ。claim済みのインターフェースを
+// 返却してからデバイスを閉じ、次の接続を受けられる状態へ戻す。
 static void closeReader() {
     ready = false;
     if (device) {
@@ -403,6 +434,8 @@ static void closeReader() {
     disconnected = false;
 }
 
+// 通知されたアドレスを開き、機種判定→Bulk通信路の取得→RF初期化の順に進む。
+// USB接続成功だけではreadyにせず、リーダーの初期化成功まで待つ。
 static void openReader(uint8_t address) {
     if (device || usb_host_device_open(client, address, &device) != ESP_OK) return;
     const usb_device_desc_t* desc;
@@ -413,22 +446,28 @@ static void openReader(uint8_t address) {
     }
     const usb_config_desc_t* config;
     if (usb_host_get_active_config_descriptor(device, &config) != ESP_OK) { closeReader(); return; }
+    // 同一インターフェース／代替設定のBulk INとOUTの組を探す。
+    // 固定のエンドポイント番号を仮定せず、長さ付きディスクリプタを順に走査する。
     epIn = epOut = 0;
     uint8_t alt = 0;
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(config);
     for (size_t pos = config->bLength; pos + 2 <= config->wTotalLength;) {
         uint8_t len = bytes[pos], type = bytes[pos + 1];
+        // 不正な長さで無限ループや設定領域外アクセスを起こさない。
         if (len < 2 || pos + len > config->wTotalLength) break;
         if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE && len >= 9) {
+            // 直前のインターフェースでIN/OUTが揃っていれば、その組を採用する。
             if (epIn && epOut) break;
             interfaceNumber = bytes[pos + 2]; alt = bytes[pos + 3]; epIn = epOut = 0;
         } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT && len >= 7 && (bytes[pos + 3] & 3) == 2) {
+            // bmAttributes下位2bitが2ならBulk。INのwMaxPacketSizeも取得する。
             uint8_t ep = bytes[pos + 2];
             if (ep & 0x80) { epIn = ep; inPacketSize = (bytes[pos + 4] | (bytes[pos + 5] << 8)) & 0x7ff; }
             else epOut = ep;
         }
         pos += len;
     }
+    // 通信路が揃い、インターフェースをclaimできた場合だけ初期化へ進む。
     if (!epIn || !epOut || !inPacketSize ||
         usb_host_interface_claim(client, device, interfaceNumber, alt) != ESP_OK) {
         show("USB接続エラー"); closeReader(); return;
@@ -456,14 +495,18 @@ void setup() {
     avatar.setColorPalette(palette);
     avatar.setSpeechFont(&fonts::lgfxJapanGothic_24);
     avatar.init(8);
+    // USB-Aホスト端子へ給電する。USB-Cの書き込み用接続とは別の端子。
     M5.Power.setExtOutput(true, m5::ext_USB);
     show("RC-S380を接続してください");
     usb_host_config_t host = {};
     host.intr_flags = ESP_INTR_FLAG_LEVEL1;
     ESP_ERROR_CHECK(usb_host_install(&host));
+    // 列挙・接続管理などライブラリ全体のイベントは専用タスクで処理する。
+    // アプリのコールバックを動かすclientイベント処理とは役割が異なる。
     xTaskCreate([](void*) {
         while (true) { uint32_t flags; usb_host_lib_handle_events(portMAX_DELAY, &flags); }
     }, "usb-daemon", 4096, nullptr, 5, nullptr);
+    // 非同期クライアントを登録。接続・切断通知はusbEventで受ける。
     usb_host_client_config_t cc = {};
     cc.max_num_event_msg = 8;
     cc.async.client_event_callback = usbEvent;
@@ -490,6 +533,8 @@ void loop() {
         if (diagnostic == 'd') Serial.printf("UI frames=%lu balance=%d\n", (unsigned long)uiFrames, int(uiRenderedBalance));
     }
     updateReadConfirmation();
+    // 通信待ちでない間も接続／切断通知を受け取る。
+    // 先に切断を片付け、その後で新しいデバイスを開く。
     usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
     if (disconnected) { closeReader(); show("RC-S380を接続してください"); }
     if (pendingAddress) { uint8_t address = pendingAddress; pendingAddress = 0; openReader(address); }
@@ -509,6 +554,7 @@ void loop() {
     int balance = -1;
     const Station* station = nullptr;
     const auto rawResult = readBalance(balance, station, stationSpeechEnabled() && lastRawResult != ReadResult::Balance);
+    // 読取中にUSBが抜けた場合、結果を画面・音声へ渡さない。
     if (disconnected) return;
     const bool confirmRead = rawResult == ReadResult::Balance && lastRawResult != ReadResult::Balance;
     lastRawResult = rawResult;
