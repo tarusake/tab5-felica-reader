@@ -127,7 +127,7 @@ void worker(void*) {
         const float gain = 28000.0f / peak;
         for (size_t i = 0; i < audio.used; ++i) audio.samples[i] = int16_t(audio.samples[i] * gain);
         const uint8_t previousVolume = M5.Speaker.getVolume();
-        M5.Speaker.setVolume(176);
+        M5.Speaker.setVolume(255);
         if (!M5.Speaker.playRaw(audio.samples, audio.used, sampleRate, false, 1, 0, false)) {
             M5.Speaker.setVolume(previousVolume);
             Serial.println("TTS playback failed");
